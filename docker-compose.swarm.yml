@@ -1,0 +1,196 @@
+# =====================================================================================================
+# BodegaNube - despliegue en DOCKER SWARM (cluster de 3 nodos EC2 en AWS: 1 manager + 2 workers)
+#
+#   docker stack deploy -c docker-compose.swarm.yml --with-registry-auth bodeganube
+#   (lo hace swarm/scripts/desplegar.sh, que antes crea los secretos)
+#
+# Diferencias con docker-compose.yml (local):
+#   - Usa las imagenes que publica el pipeline de cada microservicio en GitHub Container Registry.
+#   - La seccion "deploy" define replicas, actualizaciones sin corte (rolling update con rollback),
+#     politica de reinicio, limites de CPU/memoria y en que nodos corre cada servicio.
+#   - Las contrasenas y claves son secretos de Swarm (cifrados), no variables de entorno.
+#   - Solo el gateway publica un puerto (8080). Los microservicios quedan en la red overlay interna:
+#     desde Internet no se puede llegar a ellos directamente.
+# =====================================================================================================
+version: "3.8"
+
+# Configuracion comun de los microservicios Java (ancla YAML que se reutiliza mas abajo)
+x-despliegue-java: &despliegue-java
+  update_config:
+    parallelism: 1          # actualiza de a una replica
+    delay: 10s
+    order: start-first      # primero levanta la nueva replica y espera que este healthy, despues baja la vieja
+    failure_action: rollback
+    monitor: 60s
+  rollback_config:
+    parallelism: 1
+    order: stop-first
+  restart_policy:
+    condition: any          # si una replica se cae, Swarm la vuelve a levantar
+    delay: 10s
+  resources:
+    limits:
+      cpus: "0.75"
+      memory: 640M
+    reservations:
+      cpus: "0.10"
+      memory: 320M
+  placement:
+    preferences:
+      - spread: node.id     # reparte las replicas entre los nodos (si se cae un nodo, quedan replicas vivas)
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/DB_PASSWORD
+    secrets:
+      - source: db_password
+        target: DB_PASSWORD
+    configs:
+      - source: crear_bases
+        target: /docker-entrypoint-initdb.d/01-crear-bases.sql
+    volumes:
+      - datos-postgres:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    deploy:
+      replicas: 1
+      placement:
+        # El volumen con los datos vive en el disco del manager: la base siempre corre ahi
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: any
+      resources:
+        limits:
+          memory: 512M
+
+  ms-autenticacion:
+    image: ${REGISTRO:-ghcr.io/caso-bodega}/ms-autenticacion:${TAG:-latest}
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/bodeganube_auth
+      DB_USER: postgres
+      SPRING_JPA_SHOW_SQL: "false"
+    secrets:
+      - source: db_password
+        target: DB_PASSWORD
+      - source: jwt_secret
+        target: JWT_SECRET
+      - source: operario_password
+        target: OPERARIO_PASSWORD
+      - source: comercio_password
+        target: COMERCIO_PASSWORD
+    networks:
+      - backend
+    deploy:
+      <<: *despliegue-java
+      replicas: 1
+
+  ms-ordenes:
+    image: ${REGISTRO:-ghcr.io/caso-bodega}/ms-ordenes:${TAG:-latest}
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/bodeganube_ordenes
+      DB_USER: postgres
+      INVENTARIO_URL: http://ms-inventario:8083
+      SPRING_JPA_SHOW_SQL: "false"
+    secrets:
+      - source: db_password
+        target: DB_PASSWORD
+    networks:
+      - backend
+    deploy:
+      <<: *despliegue-java
+      replicas: 2
+
+  ms-inventario:
+    image: ${REGISTRO:-ghcr.io/caso-bodega}/ms-inventario:${TAG:-latest}
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/bodeganube_inventario
+      DB_USER: postgres
+      SPRING_JPA_SHOW_SQL: "false"
+    secrets:
+      - source: db_password
+        target: DB_PASSWORD
+    networks:
+      - backend
+    deploy:
+      <<: *despliegue-java
+      replicas: 2
+
+  ms-picking-despacho:
+    image: ${REGISTRO:-ghcr.io/caso-bodega}/ms-picking-despacho:${TAG:-latest}
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/bodeganube_picking
+      DB_USER: postgres
+      SPRING_JPA_SHOW_SQL: "false"
+    secrets:
+      - source: db_password
+        target: DB_PASSWORD
+    networks:
+      - backend
+    deploy:
+      <<: *despliegue-java
+      replicas: 1
+
+  ms-gateway:
+    image: ${REGISTRO:-ghcr.io/caso-bodega}/ms-gateway:${TAG:-latest}
+    environment:
+      # "ms-ordenes" es el nombre del servicio en la red overlay: Swarm lo resuelve a una IP virtual y
+      # reparte las peticiones entre todas sus replicas (balanceo interno).
+      MS_AUTENTICACION_URL: http://ms-autenticacion:8081
+      MS_ORDENES_URL: http://ms-ordenes:8082
+      MS_INVENTARIO_URL: http://ms-inventario:8083
+      MS_PICKING_URL: http://ms-picking-despacho:8084
+    secrets:
+      - source: jwt_secret
+        target: JWT_SECRET
+      - source: webhook_api_key
+        target: WEBHOOK_API_KEY
+    ports:
+      # Modo ingress (routing mesh): el puerto 8080 responde en CUALQUIER nodo del cluster y Swarm reenvia
+      # la peticion a una replica sana del gateway, este en el nodo que este.
+      - target: 8080
+        published: 8080
+        protocol: tcp
+        mode: ingress
+    networks:
+      - backend
+    deploy:
+      <<: *despliegue-java
+      replicas: 2
+
+networks:
+  backend:
+    driver: overlay
+
+volumes:
+  datos-postgres:
+
+# Los secretos se crean una sola vez con swarm/scripts/crear-secretos.sh (external = ya existen en el cluster)
+secrets:
+  db_password:
+    external: true
+    name: bodeganube_db_password
+  jwt_secret:
+    external: true
+    name: bodeganube_jwt_secret
+  webhook_api_key:
+    external: true
+    name: bodeganube_webhook_api_key
+  operario_password:
+    external: true
+    name: bodeganube_operario_password
+  comercio_password:
+    external: true
+    name: bodeganube_comercio_password
+
+configs:
+  crear_bases:
+    file: ./postgres/01-crear-bases.sql
