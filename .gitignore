@@ -1,0 +1,5 @@
+# Secretos y llaves: nunca se suben al repositorio
+.secretos.env
+*.pem
+.env
+*.env

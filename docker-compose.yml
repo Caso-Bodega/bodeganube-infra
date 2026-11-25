@@ -1,0 +1,120 @@
+# =====================================================================================================
+# BodegaNube - entorno LOCAL con Docker Compose
+#
+# Construye las 5 imagenes desde el codigo de cada repositorio y levanta todo el sistema en un solo PC.
+# Requiere los repositorios clonados uno al lado del otro, en la misma carpeta:
+#     <carpeta>/ms-autenticacion  ms-gateway  ms-ordenes  ms-inventario  ms-picking-despacho  bodeganube-infra
+#
+#   docker compose up -d --build     construye las imagenes e inicia los contenedores
+#   docker compose ps                estado y salud (healthy) de cada contenedor
+#   docker compose logs -f ms-ordenes
+#   docker compose down              detiene todo (agrega -v para borrar tambien la base de datos)
+#
+# Cada microservicio publica su puerto (8081 a 8084) para probarlo directo con su coleccion de Postman;
+# el gateway queda en http://localhost:8080 (o en el puerto de GATEWAY_PUERTO). El despliegue en el cluster
+# usa docker-compose.swarm.yml.
+# =====================================================================================================
+name: bodeganube
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    volumes:
+      - datos-postgres:/var/lib/postgresql/data
+      # Crea las 4 bases (una por microservicio) la primera vez que arranca
+      - ./postgres/01-crear-bases.sql:/docker-entrypoint-initdb.d/01-crear-bases.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  ms-autenticacion:
+    build: ../ms-autenticacion
+    image: bodeganube/ms-autenticacion:local
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/bodeganube_auth
+      DB_USER: postgres
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      JWT_SECRET: ${JWT_SECRET:-clave-local-de-desarrollo-de-al-menos-32-caracteres}
+      SPRING_JPA_SHOW_SQL: "false"
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  ms-ordenes:
+    build: ../ms-ordenes
+    image: bodeganube/ms-ordenes:local
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/bodeganube_ordenes
+      DB_USER: postgres
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      INVENTARIO_URL: http://ms-inventario:8083
+      SPRING_JPA_SHOW_SQL: "false"
+    ports:
+      - "8082:8082"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  ms-inventario:
+    build: ../ms-inventario
+    image: bodeganube/ms-inventario:local
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/bodeganube_inventario
+      DB_USER: postgres
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      SPRING_JPA_SHOW_SQL: "false"
+    ports:
+      - "8083:8083"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  ms-picking-despacho:
+    build: ../ms-picking-despacho
+    image: bodeganube/ms-picking-despacho:local
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/bodeganube_picking
+      DB_USER: postgres
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      SPRING_JPA_SHOW_SQL: "false"
+    ports:
+      - "8084:8084"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  ms-gateway:
+    build: ../ms-gateway
+    image: bodeganube/ms-gateway:local
+    environment:
+      # Dentro de la red de Compose cada servicio se encuentra por su nombre
+      MS_AUTENTICACION_URL: http://ms-autenticacion:8081
+      MS_ORDENES_URL: http://ms-ordenes:8082
+      MS_INVENTARIO_URL: http://ms-inventario:8083
+      MS_PICKING_URL: http://ms-picking-despacho:8084
+      JWT_SECRET: ${JWT_SECRET:-clave-local-de-desarrollo-de-al-menos-32-caracteres}
+      WEBHOOK_API_KEY: ${WEBHOOK_API_KEY:-clave-local-solo-para-desarrollo}
+    ports:
+      # Si el 8080 ya esta ocupado en tu PC:  GATEWAY_PUERTO=18080 docker compose up -d
+      - "${GATEWAY_PUERTO:-8080}:8080"
+    depends_on:
+      - ms-autenticacion
+      - ms-ordenes
+      - ms-inventario
+      - ms-picking-despacho
+    restart: unless-stopped
+
+volumes:
+  datos-postgres:

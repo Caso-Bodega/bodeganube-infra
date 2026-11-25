@@ -1,0 +1,3 @@
+# Los scripts de shell corren en Linux (EC2): siempre con fin de linea LF
+*.sh text eol=lf
+* text=auto
